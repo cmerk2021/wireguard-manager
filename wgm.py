@@ -70,7 +70,9 @@ def is_admin() -> bool:
 def require_admin():
     if not is_admin():
         console.print("[bold yellow]⚠  Elevation required. Relaunching as administrator...[/bold yellow]")
-        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
+        script = " ".join([f'"{sys.executable}"'] + sys.argv)
+        wrapped = f'/c {script} & pause'
+        ctypes.windll.shell32.ShellExecuteW(None, "runas", "cmd.exe", wrapped, None, 1)
         raise typer.Exit(0)
 
 
@@ -388,6 +390,7 @@ def status(
     tunnel: str = typer.Argument(None, help="Tunnel name — omit to show all active tunnels"),
 ):
     """Show live status of active WireGuard tunnel(s)."""
+    require_admin()
     ensure_deps()
     wg_dir = get_wg_dir()
 
