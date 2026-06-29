@@ -13,6 +13,7 @@ WireGuard's native tooling is minimal by design. WGM builds on top of it:
 - **Rich terminal output** — colored status tables, live peer stats, panels with transfer data
 - **Safe key handling** — generate key pairs in one command, validation catches missing or placeholder keys before any tunnel comes up
 - **Seamless elevation** — automatically relaunches as administrator when needed; no manual UAC prompts
+- **Health-aware `up`** — polls for a WireGuard handshake after the tunnel service starts, warns with troubleshooting tips if none arrives, and optionally pings a host behind each peer to confirm end-to-end reachability
 
 ---
 
@@ -54,6 +55,7 @@ wgm:
   settings:
     wireguard_dir: "C:\\Program Files\\WireGuard"
     default_mtu: 1420
+    handshake_timeout: 30   # seconds to wait for first handshake on `wgm up`
 
   resources:
     subnet_lists:
@@ -92,6 +94,7 @@ tunnels:
         allowed_ips:
           - "@all_traffic"            # resolves to subnet_lists.all_traffic
         persistent_keepalive: 25
+        health_check_ip: "10.0.0.1"  # pinged after handshake to confirm reachability
 
   split:
     description: "Split-tunnel — office subnets only"
@@ -105,6 +108,7 @@ tunnels:
         endpoint: "@office_vpn"
         allowed_ips:
           - "@office_subnets"         # only route office traffic
+        health_check_ip: "10.0.0.1"
 ```
 
 ### Resource references
@@ -139,19 +143,58 @@ $ wgm list
 
 ### `wgm up <tunnel>`
 
-Bring up a tunnel. WGM will:
+Bring up a tunnel. WGM runs three phases:
+
+**Phase 1 — Install**
 
 1. Resolve all `@resource` references
 2. Validate the config (catches missing/placeholder private keys)
 3. Write a `.conf` to the tunnels directory
 4. Install the WireGuard tunnel service
 
-Requires administrator privileges — WGM will relaunch elevated automatically if needed.
+**Phase 2 — Handshake check**
+
+After the service starts, WGM polls `wg show <tunnel>` every 2 seconds waiting for any peer to report a handshake. The timeout defaults to 30 seconds and is configurable via `wgm.settings.handshake_timeout`.
+
+- If a handshake is detected in time, the tunnel is reported as **healthy**.
+- If the timeout expires with no handshake, WGM prints a warning panel with common causes and fixes, then prompts you to keep the tunnel up for manual troubleshooting or bring it straight back down.
+
+**Phase 3 — Ping health checks** *(optional)*
+
+For each peer that has a `health_check_ip` set, WGM sends a single ICMP ping to that address through the tunnel. Results are shown in a compact table. A failed ping is a warning, not a fatal error — the tunnel is up and the handshake succeeded, so the issue is host-level reachability rather than the VPN itself.
+
+Requires administrator privileges.
 
 ```
 $ wgm up office
 ✓ Config written
-✓ Tunnel office is up
+✓ Tunnel service installed
+✓ Handshake confirmed — tunnel office is healthy
+
+ Peer            Health check IP   Reachable
+ Office Gateway  10.0.0.1          ✓
+✓ All health checks passed
+```
+
+Example when no handshake arrives:
+
+```
+$ wgm up office
+✓ Config written
+✓ Tunnel service installed
+╭─ ⚠  No handshake detected on 'office' ──────────────────────────────╮
+│ Common causes and fixes:                                             │
+│                                                                      │
+│   1. Firewall blocking UDP                                           │
+│      Ensure port 51820/UDP is open on the server and any NAT.       │
+│   2. Wrong peer public key                                           │
+│      ...                                                             │
+╰──────────────────────────────────────────────────────────────────────╯
+
+What would you like to do?
+  [k] Keep the tunnel up and troubleshoot manually
+  [d] Bring the tunnel down
+Choice [k]:
 ```
 
 ---
@@ -170,14 +213,15 @@ $ wgm down office
 
 ### `wgm restart <tunnel>`
 
-Bring a tunnel down then immediately back up. Useful after editing `wgm.yaml` to apply changes without manually running `down` and `up`.
+Bring a tunnel down then immediately back up. Useful after editing `wgm.yaml` to apply changes without manually running `down` and `up`. The handshake check and ping health checks run as part of the `up` phase.
 
 ```
 $ wgm restart office
 ✓ Tunnel office is down
   Config file cleaned up
 ✓ Config written
-✓ Tunnel office is up
+✓ Tunnel service installed
+✓ Handshake confirmed — tunnel office is healthy
 ```
 
 ---
@@ -229,6 +273,10 @@ Print the installed WGM version.
 wgm.yaml  ──resolve refs──▶  in-memory config  ──generate──▶  tunnel.conf
                                                                     │
                                                          wireguard.exe /installtunnelservice
+                                                                    │
+                                                         poll wg show (handshake?)
+                                                                    │
+                                                         ping health_check_ip (per peer)
 ```
 
 WGM never edits your `wgm.yaml`. The generated `.conf` files in the `tunnels\` directory are ephemeral — they are written on `up` and deleted on `down`.
@@ -239,7 +287,11 @@ WGM never edits your `wgm.yaml`. The generated `.conf` files in the `tunnels\` d
 
 **Use `default_mtu`** under `wgm.settings` to apply a consistent MTU across all tunnels without repeating it per-interface. A per-tunnel `mtu` under the interface block takes precedence.
 
-**Name your peers** with a `name` key in the peer list. WGM uses this label in `status` output instead of a truncated public key.
+**Name your peers** with a `name` key in the peer list. WGM uses this label in `status` output and health check results instead of a truncated public key.
+
+**`health_check_ip`** should be a host reachable *through* the tunnel — typically a gateway, internal DNS server, or any always-on host on the remote network. WGM pings it over the tunnel after a successful handshake, so a failure here points to a routing or firewall issue on the remote side rather than the VPN connection itself.
+
+**`handshake_timeout`** defaults to 30 seconds. WireGuard initiates a handshake roughly 5 seconds after the tunnel comes up; 30 seconds gives plenty of margin for slow networks. Raise it if you're on a high-latency link, lower it if you want faster failure feedback.
 
 **Placeholder keys**: WGM treats the values `x`, `YOUR_PRIVATE_KEY`, and empty string as unconfigured and will refuse to bring that tunnel up with a clear error — no silent failures.
 

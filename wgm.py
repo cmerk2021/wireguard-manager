@@ -9,6 +9,7 @@ import ctypes
 import re
 import subprocess
 import sys
+import time
 
 import typer
 import os
@@ -270,9 +271,154 @@ def generate_config(tunnel: str) -> bool:
     return True
 
 
+# ---------- health check helpers ----------
+
+def _wait_for_handshake(tunnel: str, timeout: int = 30, poll_interval: float = 2.0) -> bool:
+    """
+    Poll `wg show <tunnel>` every *poll_interval* seconds until any peer reports a
+    latest handshake, or *timeout* seconds elapse.
+
+    Returns True if a handshake was detected, False on timeout.
+    Prints a live status line while waiting.
+    """
+    wg_dir = get_wg_dir()
+    deadline = time.monotonic() + timeout
+
+    with console.status(
+        f"[bold]Waiting for handshake[/bold] on [bold]{tunnel}[/bold]… "
+        f"(timeout {timeout}s)"
+    ) as status:
+        while time.monotonic() < deadline:
+            elapsed = int(time.monotonic() - (deadline - timeout))
+            status.update(
+                f"[bold]Waiting for handshake[/bold] on [bold]{tunnel}[/bold]… "
+                f"[dim]{elapsed}s / {timeout}s[/dim]"
+            )
+            try:
+                result = subprocess.run(
+                    [wg_dir / "wg.exe", "show", tunnel],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    parsed = parse_wg_show(result.stdout)
+                    for tdata in parsed:
+                        for peer in tdata.get("peers", []):
+                            if peer.get("latest_handshake"):
+                                return True
+            except Exception:
+                pass  # wg.exe not ready yet — keep polling
+
+            time.sleep(poll_interval)
+
+    return False
+
+
+def _print_handshake_tips(tunnel: str):
+    """Print a troubleshooting panel when no handshake is observed after timeout."""
+    tips = (
+        "[bold]Common causes and fixes:[/bold]\n\n"
+        "  [cyan]1. Firewall blocking UDP[/cyan]\n"
+        "     Ensure port 51820/UDP (or your configured port) is open on the\n"
+        "     server firewall and any router/NAT in between.\n\n"
+        "  [cyan]2. Wrong peer public key[/cyan]\n"
+        "     Double-check the [bold]public_key[/bold] under your peer in wgm.yaml matches\n"
+        "     what the server has generated with [bold]wgm keygen[/bold].\n\n"
+        "  [cyan]3. Server not listening[/cyan]\n"
+        "     Confirm WireGuard is running on the remote end and its tunnel is up.\n\n"
+        "  [cyan]4. Endpoint unreachable[/cyan]\n"
+        "     Verify the endpoint address/port in wgm.yaml is correct and reachable\n"
+        "     from this machine (try [bold]ping[/bold] or [bold]tracert[/bold] to the host).\n\n"
+        "  [cyan]5. Clock skew[/cyan]\n"
+        "     WireGuard timestamps packets. Large clock differences between peers\n"
+        "     can prevent handshakes. Sync your system clock (NTP).\n\n"
+        "  [dim]Run [bold]wgm status {tunnel}[/bold] after fixing to see live peer state.[/dim]"
+    ).format(tunnel=tunnel)
+
+    console.print(Panel(
+        tips,
+        title=f"[bold yellow]⚠  No handshake detected on '{tunnel}'[/bold yellow]",
+        border_style="yellow",
+        expand=False,
+    ))
+
+
+def _prompt_keep_or_down(tunnel: str) -> bool:
+    """
+    Interactively ask the user whether to keep the tunnel up or bring it down.
+    Returns True to keep up, False to bring down.
+    """
+    console.print()
+    console.print(
+        "[bold]What would you like to do?[/bold]\n"
+        "  [green][k][/green] Keep the tunnel up and troubleshoot manually\n"
+        "  [red][d][/red] Bring the tunnel down"
+    )
+    while True:
+        choice = typer.prompt("Choice", default="k").strip().lower()
+        if choice in ("k", "keep", ""):
+            return True
+        if choice in ("d", "down"):
+            return False
+        console.print("[dim]Please enter 'k' to keep up or 'd' to bring down.[/dim]")
+
+
+def _run_ping_health_checks(tunnel: str) -> list[tuple[str, str, bool]]:
+    """
+    For each peer in *tunnel* that has a `health_check_ip`, send a single ICMP
+    ping (Windows ping.exe -n 1 -w 2000).
+
+    Returns a list of (peer_name, ip, success) tuples for every peer that has
+    a health_check_ip configured. Peers without one are silently skipped.
+    """
+    raw_cfg = WGM_CONFIG.get("tunnels", {}).get(tunnel, {})
+    peers = raw_cfg.get("peers", [])
+    results: list[tuple[str, str, bool]] = []
+
+    for peer in peers:
+        ip = peer.get("health_check_ip")
+        if not ip:
+            continue
+
+        name = peer.get("name") or peer.get("public_key", "?")[:20]
+        try:
+            result = subprocess.run(
+                ["ping", "-n", "1", "-w", "2000", str(ip)],
+                capture_output=True, text=True, timeout=5,
+            )
+            # ping.exe exits 0 on success; non-zero (or "Request timed out") on failure
+            success = result.returncode == 0 and "TTL=" in result.stdout
+        except Exception:
+            success = False
+
+        results.append((name, str(ip), success))
+
+    return results
+
+
+def _print_ping_results(results: list[tuple[str, str, bool]]):
+    """Render ping health-check results as a compact table."""
+    if not results:
+        return
+
+    table = Table(box=box.SIMPLE_HEAD, header_style="bold", padding=(0, 1), show_edge=False)
+    table.add_column("Peer")
+    table.add_column("Health check IP")
+    table.add_column("Reachable", justify="center")
+
+    for name, ip, ok in results:
+        icon = "[bold green]✓[/bold green]" if ok else "[bold red]✗[/bold red]"
+        table.add_row(name, ip, icon)
+
+    console.print(table)
+
+
 # ---------- shared up/down logic (no elevation check — callers handle that) ----------
 
 def _do_up(tunnel: str):
+    # Resolve the handshake timeout from config, default 30s
+    settings = WGM_CONFIG.get("wgm", {}).get("settings", {})
+    handshake_timeout: int = int(settings.get("handshake_timeout", 30))
+
     with console.status(f"Generating config for [bold]{tunnel}[/bold]..."):
         ok = generate_config(tunnel)
     if not ok:
@@ -286,13 +432,46 @@ def _do_up(tunnel: str):
             capture_output=True, text=True,
         )
 
-    if result.returncode == 0:
-        console.print(f"[green]✓[/green] Tunnel [bold]{tunnel}[/bold] is [bold green]up[/bold green]")
-    else:
+    if result.returncode != 0:
         console.print(f"[bold red]✗ Failed to bring up '[bold]{tunnel}[/bold]'[/bold red]")
         if result.stderr.strip():
             console.print(f"[dim]{result.stderr.strip()}[/dim]")
         raise typer.Exit(1)
+
+    console.print(f"[green]✓[/green] Tunnel service installed")
+
+    # ── Phase 2: wait for handshake ──────────────────────────────────────────
+    handshake_ok = _wait_for_handshake(tunnel, timeout=handshake_timeout)
+
+    if handshake_ok:
+        console.print(f"[green]✓[/green] Handshake confirmed — tunnel [bold]{tunnel}[/bold] is [bold green]healthy[/bold green]")
+
+        # ── Phase 3: ping health checks (optional, per peer) ─────────────────
+        ping_results = _run_ping_health_checks(tunnel)
+        if ping_results:
+            _print_ping_results(ping_results)
+            failures = [r for r in ping_results if not r[2]]
+            if failures:
+                for name, ip, _ in failures:
+                    console.print(
+                        f"[yellow]⚠[/yellow]  Health check failed for peer [bold]{name}[/bold] "
+                        f"([dim]{ip}[/dim]) — tunnel is up but that host is not reachable."
+                    )
+            else:
+                console.print("[green]✓[/green] All health checks passed")
+    else:
+        # No handshake within timeout
+        _print_handshake_tips(tunnel)
+
+        keep = _prompt_keep_or_down(tunnel)
+        if keep:
+            console.print(
+                f"\n[yellow]⚠[/yellow]  Tunnel [bold]{tunnel}[/bold] is [bold yellow]up (no handshake)[/bold yellow] — "
+                "use [bold]wgm status {tunnel}[/bold] to monitor.".format(tunnel=tunnel)
+            )
+        else:
+            console.print()
+            _do_down(tunnel)
 
 
 def _do_down(tunnel: str):
