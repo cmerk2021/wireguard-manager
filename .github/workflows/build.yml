@@ -2,8 +2,10 @@ name: Build & Release
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+
+permissions:
+  contents: write
 
 jobs:
   release:
@@ -12,36 +14,85 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
 
+      # 📦 install deps (cached via actions/setup-python)
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
 
-      - name: Resolve version
+      # 🧠 Auto versioning (based on tags)
+      - name: Determine version
         id: version
         shell: bash
         run: |
-          VERSION=$(python -c "from version import __version__; print(__version__)")
-          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
-          echo "Resolved version: $VERSION"
+          git fetch --tags
 
+          LAST_TAG=$(git tag --sort=-v:refname | head -n 1)
+
+          if [ -z "$LAST_TAG" ]; then
+            VERSION="0.1.0"
+          else
+            VERSION=${LAST_TAG#v}
+          fi
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "last_tag=$LAST_TAG" >> $GITHUB_OUTPUT
+
+      # 🧾 Generate changelog from commits
+      - name: Generate changelog
+        id: changelog
+        shell: bash
+        run: |
+          if [ -z "${{ steps.version.outputs.last_tag }}" ]; then
+            LOG=$(git log --pretty=format:"- %s")
+          else
+            LOG=$(git log ${{ steps.version.outputs.last_tag }}..HEAD --pretty=format:"- %s")
+          fi
+
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          echo "$LOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      # 🏗 Build executable
       - name: Build exe
-        run: >
-          pyinstaller
-          --onefile
-          --name wgm
-          --add-data "version.py;."
-          wgm.py
+        shell: bash
+        run: |
+          python -m PyInstaller \
+            --onefile \
+            --name wgm \
+            --add-data "version.py;." \
+            wgm.py
 
-      - name: Create GitHub release
+      # 🏷 Create Git tag
+      - name: Create tag
+        shell: bash
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          VERSION="v${{ steps.version.outputs.version }}"
+
+          git tag $VERSION
+          git push origin $VERSION
+
+      # 🚀 Create GitHub release
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: "v${{ steps.version.outputs.VERSION }}"
-          name: "v${{ steps.version.outputs.VERSION }}"
-          files: dist/wgm.exe
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: v${{ steps.version.outputs.version }}
+          name: v${{ steps.version.outputs.version }}
+          body: |
+            ## Changelog
+            ${{ steps.changelog.outputs.changelog }}
+          files: |
+            dist/wgm.exe
