@@ -30,23 +30,12 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      # 🧠 Auto versioning (based on tags)
-      - name: Determine version
+      - name: Resolve version
         id: version
         shell: bash
         run: |
-          git fetch --tags
-
-          LAST_TAG=$(git tag --sort=-v:refname | head -n 1)
-
-          if [ -z "$LAST_TAG" ]; then
-            VERSION="0.1.0"
-          else
-            VERSION=${LAST_TAG#v}
-          fi
-
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "last_tag=$LAST_TAG" >> $GITHUB_OUTPUT
+          VERSION=$(python -c "from version import __version__; print(__version__)")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       # 🧾 Generate changelog from commits
       - name: Generate changelog
