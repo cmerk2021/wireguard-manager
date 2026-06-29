@@ -1,0 +1,4 @@
+typer[all]
+rich
+ruamel.yaml
+pyinstaller
