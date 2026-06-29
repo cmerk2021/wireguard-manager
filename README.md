@@ -12,7 +12,6 @@ WireGuard's native tooling is minimal by design. WGM builds on top of it:
 - **Reusable resources** — define subnet lists, DNS profiles, and endpoints once, reference them across any tunnel
 - **Rich terminal output** — colored status tables, live peer stats, panels with transfer data
 - **Safe key handling** — generate key pairs in one command, validation catches missing or placeholder keys before any tunnel comes up
-- **Seamless elevation** — automatically relaunches as administrator when needed; no manual UAC prompts
 - **Health-aware `up`** — polls for a WireGuard handshake after the tunnel service starts, warns with troubleshooting tips if none arrives, and optionally pings a host behind each peer to confirm end-to-end reachability
 
 ---
@@ -26,7 +25,17 @@ WireGuard's native tooling is minimal by design. WGM builds on top of it:
 
 ## Installation
 
-<!-- TODO: add download link / release instructions -->
+### CMAM Install (Recommended)
+
+If you have [CMAM](https://github.com/cmerk2021/CMAM) installed, just run:
+
+```
+cmam install wgm
+```
+
+### Manual Install
+
+Alternatively, download `wgm.exe` from the latest release to a folder that is in your PATH.
 
 No additional dependencies required — WGM ships as a standalone `.exe`.
 
