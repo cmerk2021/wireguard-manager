@@ -69,13 +69,9 @@ def is_admin() -> bool:
 
 def require_admin():
     if not is_admin():
-        console.print("[bold yellow]⚠  Elevation required. Relaunching as administrator...[/bold yellow]")
-        # argv[0] is the exe itself — pass it as the executable, not an argument
-        exe = f'"{sys.argv[0]}"'
-        args = " ".join([f'"{a}"' for a in sys.argv[1:]])
-        wrapped = f'/c {exe} {args} & pause'
-        ctypes.windll.shell32.ShellExecuteW(None, "runas", "cmd.exe", wrapped, None, 1)
-        raise typer.Exit(0)
+        console.print("[bold red]Error:[/bold red] This command requires administrator privileges.")
+        console.print("[dim]Please run wgm from an elevated terminal (Run as Administrator).[/dim]")
+        raise typer.Exit(1)
 
 
 def get_active_tunnel_names() -> set[str]:
