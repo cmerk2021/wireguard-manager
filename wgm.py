@@ -16,18 +16,39 @@ import os
 from version import __version__
 from pathlib import Path
 from rich.console import Console
+from rich.theme import Theme
 from rich.table import Table
 from rich import box
 from rich.panel import Panel
 from ruamel.yaml import YAML
+from ruamel.yaml.comments import CommentedMap
 
 # ====================
 # GLOBALS
 # ====================
 
-app = typer.Typer(help="WGM — WireGuard Manager for Windows")
-console = Console()
+THEME = Theme({
+    "success": "bold green",
+    "error":   "bold red",
+    "warning": "bold yellow",
+    "info":    "cyan",
+    "muted":   "dim",
+    "heading": "bold cyan",
+    "accent":  "magenta",
+    "key":     "yellow",
+})
+
+app = typer.Typer(
+    help="WGM — WireGuard Manager for Windows",
+    no_args_is_help=True,
+    add_completion=False,
+    rich_markup_mode="rich",
+)
+console = Console(theme=THEME)
+
 yaml = YAML()
+yaml.preserve_quotes = True
+yaml.indent(mapping=2, sequence=4, offset=2)
 
 CONFIG_LOCATION = Path(os.environ["LOCALAPPDATA"]) / "WGM" / "wgm.yaml"
 STATE_LOCATION  = Path(os.environ["LOCALAPPDATA"]) / "WGM" / "state.json"
@@ -37,19 +58,121 @@ TUNNELS_LOCATION.mkdir(parents=True, exist_ok=True)
 CONFIG_LOCATION.touch(exist_ok=True)
 STATE_LOCATION.touch(exist_ok=True)
 
-with open(CONFIG_LOCATION) as _f:
-    WGM_CONFIG: dict = yaml.load(_f) or {}
+# Errors encountered while resolving `include:` directives (populated on load).
+INCLUDE_ERRORS: list[str] = []
+
+
+# ====================
+# CONFIG LOADING
+# ====================
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge *override* into *base*, returning plain dicts."""
+    result = dict(base) if isinstance(base, dict) else {}
+    for key, val in (override or {}).items():
+        if key in result and isinstance(result.get(key), dict) and isinstance(val, dict):
+            result[key] = _deep_merge(result[key], val)
+        else:
+            result[key] = val
+    return result
+
+
+def _resolve_includes(node, base_dir: Path, seen: set):
+    """
+    Recursively resolve `include:` directives. Wherever a mapping contains an
+    `include` key (a path or list of paths), the referenced YAML file(s) are
+    loaded and merged in. Local keys take precedence over included ones.
+    """
+    if isinstance(node, dict):
+        out: dict = {}
+        include_val = node.get("include")
+        for key, val in node.items():
+            if key == "include":
+                continue
+            out[key] = _resolve_includes(val, base_dir, seen)
+
+        if include_val is not None:
+            paths = include_val if isinstance(include_val, (list, tuple)) else [include_val]
+            merged: dict = {}
+            for raw_path in paths:
+                inc_path = (base_dir / str(raw_path)).resolve()
+                if inc_path in seen:
+                    continue
+                seen.add(inc_path)
+                if not inc_path.exists():
+                    INCLUDE_ERRORS.append(f"file not found: {raw_path}")
+                    continue
+                try:
+                    with open(inc_path, encoding="utf-8") as f:
+                        data = yaml.load(f) or {}
+                except Exception as exc:
+                    INCLUDE_ERRORS.append(f"failed to parse {raw_path}: {exc}")
+                    continue
+                data = _resolve_includes(data, inc_path.parent, seen)
+                merged = _deep_merge(merged, data)
+            out = _deep_merge(merged, out)
+        return out
+
+    if isinstance(node, list):
+        return [_resolve_includes(item, base_dir, seen) for item in node]
+    return node
+
+
+def load_merged_config() -> dict:
+    """Load wgm.yaml with all `include:` directives resolved (read-only view)."""
+    INCLUDE_ERRORS.clear()
+    with open(CONFIG_LOCATION, encoding="utf-8") as f:
+        raw = yaml.load(f) or {}
+    return _resolve_includes(raw, CONFIG_LOCATION.parent, set())
+
+
+def reload_config() -> dict:
+    """Reload the merged config into the module global and return it."""
+    global WGM_CONFIG
+    WGM_CONFIG = load_merged_config()
+    return WGM_CONFIG
+
+
+def load_raw_config():
+    """Load the main wgm.yaml verbatim (round-trip) for editing/saving."""
+    with open(CONFIG_LOCATION, encoding="utf-8") as f:
+        return yaml.load(f) or CommentedMap()
+
+
+def save_raw_config(data) -> None:
+    """Write *data* back to the main wgm.yaml and refresh the merged view."""
+    with open(CONFIG_LOCATION, "w", encoding="utf-8") as f:
+        yaml.dump(data, f)
+    reload_config()
+
+
+def ensure_skeleton(raw) -> None:
+    """Ensure the wgm/settings/resources/tunnels structure exists (in place)."""
+    raw.setdefault("wgm", {})
+    raw["wgm"].setdefault("settings", {})
+    raw["wgm"].setdefault("resources", {})
+    raw.setdefault("tunnels", {})
+
+
+WGM_CONFIG: dict = load_merged_config()
+
 
 # ====================
 # HELPERS
 # ====================
 
+def resolve_wg_dir() -> Path | None:
+    """Return the configured WireGuard directory, or None if unset."""
+    val = WGM_CONFIG.get("wgm", {}).get("settings", {}).get("wireguard_dir")
+    return Path(val) if val else None
+
+
 def get_wg_dir() -> Path:
-    try:
-        return Path(WGM_CONFIG["wgm"]["settings"]["wireguard_dir"])
-    except (KeyError, TypeError):
-        console.print("[bold red]Error:[/bold red] wireguard_dir not set in wgm.yaml under wgm.settings.")
+    wg_dir = resolve_wg_dir()
+    if wg_dir is None:
+        console.print("[error]Error:[/error] wireguard_dir not set. Run [bold]wgm config edit[/bold] to set it.")
         raise typer.Exit(1)
+    return wg_dir
 
 
 def ensure_deps():
@@ -155,6 +278,93 @@ def parse_wg_show(output: str) -> list[dict]:
                 current_peer["keepalive"] = val
 
     return tunnels
+
+
+def wg_dump() -> dict:
+    """
+    Return machine-readable state via `wg show all dump`, keyed by interface.
+
+    Each value: {name, public_key, private_key, port, peers: [{public_key,
+    endpoint, allowed_ips, latest_handshake (int), rx (int), tx (int),
+    keepalive}]}. Returns {} if wg.exe is unavailable or nothing is up.
+    """
+    wg_dir = resolve_wg_dir()
+    if wg_dir is None:
+        return {}
+    try:
+        result = subprocess.run(
+            [wg_dir / "wg.exe", "show", "all", "dump"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return {}
+    if result.returncode != 0:
+        return {}
+
+    interfaces: dict = {}
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 5:
+            iface, priv, pub, port, _fwmark = parts
+            interfaces[iface] = {
+                "name": iface,
+                "private_key": priv,
+                "public_key": pub,
+                "port": port,
+                "peers": [],
+            }
+        elif len(parts) == 9:
+            iface, pub, _psk, endpoint, allowed, hs, rx, tx, keep = parts
+            if iface not in interfaces:
+                continue
+
+            def _to_int(v):
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    return 0
+
+            interfaces[iface]["peers"].append({
+                "public_key": pub,
+                "endpoint": "" if endpoint in ("(none)", "") else endpoint,
+                "allowed_ips": [a for a in allowed.split(",") if a and a != "(none)"],
+                "latest_handshake": _to_int(hs),
+                "rx": _to_int(rx),
+                "tx": _to_int(tx),
+                "keepalive": "" if keep in ("off", "") else keep,
+            })
+    return interfaces
+
+
+def generate_keypair() -> tuple[str, str]:
+    """Generate a WireGuard (private_key, public_key) pair via wg.exe."""
+    wg_dir = get_wg_dir()
+    priv = subprocess.run([wg_dir / "wg.exe", "genkey"], capture_output=True, text=True)
+    if priv.returncode != 0:
+        console.print("[error]Failed to generate private key.[/error]")
+        raise typer.Exit(1)
+    private_key = priv.stdout.strip()
+    return private_key, pubkey_from_private(private_key)
+
+
+def pubkey_from_private(private_key: str) -> str:
+    """Derive the public key for *private_key* via wg.exe. Returns '' on failure."""
+    wg_dir = get_wg_dir()
+    pub = subprocess.run(
+        [wg_dir / "wg.exe", "pubkey"],
+        input=private_key, capture_output=True, text=True,
+    )
+    return pub.stdout.strip() if pub.returncode == 0 else ""
+
+
+def resolve_tunnel_config(tunnel: str) -> dict | None:
+    """Return a deep-copied, @ref-resolved config dict for *tunnel* (no file write)."""
+    raw_cfg = WGM_CONFIG.get("tunnels", {}).get(tunnel)
+    if not raw_cfg:
+        return None
+    cfg = copy.deepcopy(raw_cfg)
+    resolve_refs(cfg)
+    return cfg
 
 
 def resolve_refs(cfg: dict):
@@ -514,7 +724,11 @@ def list_tunnels():
     """List all configured tunnels and whether they are currently active."""
     tunnels = WGM_CONFIG.get("tunnels", {})
     if not tunnels:
-        console.print("[yellow]No tunnels configured in wgm.yaml.[/yellow]")
+        console.print(Panel.fit(
+            "[warning]No tunnels configured yet.[/warning]\n"
+            "[dim]Create your first one with[/dim] [bold]wgm wizard[/bold]",
+            border_style="yellow",
+        ))
         return
 
     active = get_active_tunnel_names()
@@ -535,6 +749,11 @@ def list_tunnels():
         table.add_row(name, desc, addresses, n_peers, status)
 
     console.print(table)
+    up_count = sum(1 for n in tunnels if n in active)
+    console.print(
+        f"[dim]{len(tunnels)} tunnel(s) · [/dim][success]{up_count} up[/success]"
+        f"[dim] · {len(tunnels) - up_count} down[/dim]"
+    )
 
 
 @app.command()
@@ -641,31 +860,60 @@ def status(
 def keygen():
     """Generate a new WireGuard private/public key pair."""
     ensure_deps()
-    wg_dir = get_wg_dir()
-
-    priv = subprocess.run([wg_dir / "wg.exe", "genkey"], capture_output=True, text=True)
-    if priv.returncode != 0:
-        console.print("[red]Failed to generate private key.[/red]")
+    private_key, public_key = generate_keypair()
+    if not public_key:
+        console.print("[error]Failed to derive public key.[/error]")
         raise typer.Exit(1)
-    private_key = priv.stdout.strip()
-
-    pub = subprocess.run(
-        [wg_dir / "wg.exe", "pubkey"],
-        input=private_key, capture_output=True, text=True,
-    )
-    if pub.returncode != 0:
-        console.print("[red]Failed to derive public key.[/red]")
-        raise typer.Exit(1)
-    public_key = pub.stdout.strip()
 
     console.print(Panel(
-        f"[bold]Private Key[/bold]  [yellow]{private_key}[/yellow]\n"
-        f"[bold]Public Key[/bold]   [cyan]{public_key}[/cyan]\n\n"
+        f"[bold]Private Key[/bold]  [key]{private_key}[/key]\n"
+        f"[bold]Public Key[/bold]   [info]{public_key}[/info]\n\n"
         "[dim]⚠  Keep your private key secret — never share it.[/dim]",
         title="New Key Pair",
         border_style="cyan",
         expand=False,
     ))
+
+
+@app.command()
+def wizard(
+    expert: bool = typer.Option(False, "--expert", "-e", help="Start directly in expert mode."),
+):
+    """Interactively create a fully working tunnel — no YAML editing required."""
+    from wgmlib import wizard as _wizard
+    _wizard.run(prefer_expert=expert)
+
+
+@app.command()
+def doctor(
+    tunnel: str = typer.Argument(None, help="Tunnel to diagnose — omit for general checks."),
+):
+    """Run diagnostics with troubleshooting steps (optionally for one tunnel)."""
+    from wgmlib import doctor as _doctor
+    _doctor.run(tunnel)
+
+
+@app.command()
+def monitor(
+    interval: float = typer.Option(1.0, "--interval", "-i", help="Refresh interval in seconds."),
+):
+    """Live full-screen dashboard of all tunnels (real-time transfer & health)."""
+    from wgmlib import monitor as _monitor
+    _monitor.run(interval)
+
+
+@app.command("stat", hidden=True)
+def stat(
+    interval: float = typer.Option(1.0, "--interval", "-i", help="Refresh interval in seconds."),
+):
+    """Alias for 'wgm monitor'."""
+    from wgmlib import monitor as _monitor
+    _monitor.run(interval)
+
+
+# Register `wgm config` sub-commands (add / edit / remove / validate / path).
+from wgmlib.configcmd import config_app  # noqa: E402
+app.add_typer(config_app, name="config")
 
 
 if __name__ == "__main__":
