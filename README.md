@@ -16,7 +16,11 @@ WireGuard's native tooling is minimal by design. WGM builds on top of it:
 - **Reusable resources** — define subnet lists, DNS profiles, and endpoints once, reference them across any tunnel
 - **Split your config** — pull tunnels or resources into separate files with `include:`
 - **Rich terminal output** — colored status tables, live peer stats, panels with transfer data
-- **Live dashboard** — `wgm monitor` is an htop-style, full-screen view of every tunnel with real-time transfer rates
+- **Live dashboard** — `wgm monitor` is an htop-style, full-screen view of every tunnel with real-time transfer rates and **live throughput graphs**
+- **Hook scripts** — run `pre_up` / `post_up` / `pre_down` / `post_down` commands around each tunnel, wg-quick style
+- **Migration made easy** — `wgm import config.conf` pulls in configs from any WireGuard client, and `wgm export <tunnel>` writes a standard `.conf` back out
+- **Boot autostart** — `wgm autostart <tunnel>` registers a tunnel to come up automatically at system startup
+- **Overlap detection** — `wgm up` warns when a tunnel's routes overlap those of another tunnel that's already up
 - **Built-in diagnostics** — `wgm doctor` runs a full health suite (config, internet, DNS, endpoint resolution, handshakes) with step-by-step fixes
 - **Validation** — `wgm config validate` type-checks every field (IPs, CIDRs, ports, keys) before you connect
 - **Safe key handling** — generate key pairs in one command; validation catches missing or placeholder keys before any tunnel comes up
@@ -247,6 +251,8 @@ Bring up a tunnel. WGM runs three phases:
 3. Write a `.conf` to the tunnels directory
 4. Install the WireGuard tunnel service
 
+Before installing, WGM checks the tunnel's `AllowedIPs` against every tunnel that is **currently up** and warns if their routed subnets overlap (down tunnels are ignored). The warning is advisory — the tunnel still comes up, but you're told which routes will be taken over.
+
 **Phase 2 — Handshake check**
 
 After the service starts, WGM polls `wg show <tunnel>` every 2 seconds waiting for any peer to report a handshake. The timeout defaults to 30 seconds and is configurable via `wgm.settings.handshake_timeout`.
@@ -310,6 +316,8 @@ $ wgm down office
 
 Bring a tunnel down then immediately back up. Useful after editing `wgm.yaml` to apply changes without manually running `down` and `up`. The handshake check and ping health checks run as part of the `up` phase.
 
+Windows removes a tunnel service asynchronously, so WGM waits for the old service to fully disappear before reinstalling. This prevents the *"Tunnel already installed and running"* error that could otherwise leave a tunnel stuck between states. If the tunnel isn't up when you run `restart`, the down step is skipped automatically.
+
 ```
 $ wgm restart office
 ✓ Tunnel office is down
@@ -342,7 +350,7 @@ Omit the tunnel name to show all currently active tunnels.
 
 ### `wgm monitor` (alias `wgm stat`)
 
-A live, full-screen dashboard of every tunnel \u2014 htop-style. Shows each peer's endpoint, handshake freshness (green/yellow/red), cumulative transfer, and **real-time transfer rates** computed between refreshes, plus a running total across all tunnels. Configured-but-down tunnels are listed too.
+A live, full-screen dashboard of every tunnel \u2014 htop-style. Shows each peer's endpoint, handshake freshness (green/yellow/red), cumulative transfer, and **real-time transfer rates** computed between refreshes, plus a running total across all tunnels. A **throughput panel** draws live sparkline graphs of the aggregate download (green) and upload (magenta) rates, with running peaks. Configured-but-down tunnels are listed too.
 
 ```\nwgm monitor              # refresh every second\nwgm monitor --interval 2 # refresh every 2 seconds\n```\n\nPress **Ctrl+C** to quit. Requires administrator privileges (WireGuard only exposes live peer stats to elevated processes).\n\n---\n\n### `wgm doctor [tunnel]`\n\nRun a full diagnostic suite with troubleshooting steps for anything that fails.\n\n**General diagnostics** (no tunnel name):\n\n- Config file loads and parses\n- All `include:` files resolve\n- Config validation (errors/warnings)\n- WireGuard binaries are present\n- Administrator rights\n- Internet connectivity\n- DNS resolution\n- Which tunnels are currently active\n\n**Tunnel diagnostics** (`wgm doctor <tunnel>`) adds:\n\n- The tunnel exists and its fields are valid\n- The endpoint resolves \u2014 if it's a domain, WGM shows the resolved IP(s)\n- If the tunnel is up: per-peer handshake freshness and transfer, plus any configured `health_check_ip` pings\n\nEach failed or warned check is followed by concrete fix steps, and a summary panel tells you whether everything passed.\n\n```\n$ wgm doctor office\n\u256d\u2500 General \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e\n\u2502  \u2713  Config file loads       ...\\WGM\\wgm.yaml                    \u2502\n\u2502  \u2713  WireGuard binaries      C:\\Program Files\\WireGuard          \u2502\n\u2502  \u2713  Internet connectivity   reached 1.1.1.1                     \u2502\n\u2502  \u2713  DNS resolution          cloudflare.com \u2192 104.16.132.229      \u2502\n\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\n\u256d\u2500 Tunnel: office \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e\n\u2502  \u2713  Endpoint DNS (peer 1)   vpn.example.com \u2192 203.0.113.10        \u2502\n\u2502  \u2713  Handshake (abc123\u2026)     12s ago \u00b7 \u219314.3 MiB \u21912.1 MiB          \u2502\n\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\n```\n\n---\n\n### `wgm keygen`", "oldString": "Omit the tunnel name to show all currently active tunnels.
 
@@ -361,6 +369,70 @@ $ wgm keygen
 │ ⚠  Keep your private key secret — never share it.                   │
 ╰──────────────────────────────────────────────────────────────────────╯
 ```
+
+---
+
+### `wgm import <config.conf>`
+
+Import a standard WireGuard `.conf` file (from the official app, `wg-quick`, or any other client) as a WGM tunnel. WGM parses the `[Interface]` and `[Peer]` sections, converts any `PostUp`/`PostDown`/`PreUp`/`PreDown` directives into WGM hooks, and saves the result into `wgm.yaml`. After importing, any invalid fields are reported so you can fix them before connecting.
+
+```
+wgm import .\office.conf                 # tunnel name defaults to the file name
+wgm import .\office.conf --name office   # choose a name
+```
+
+---
+
+### `wgm export <tunnel>`
+
+Export a tunnel back to a standard WireGuard `.conf` file — handy for moving to another client or device. All `@resource` references are resolved and hooks are emitted as `PostUp`/`PostDown` directives for portability.
+
+```
+wgm export office                # print the .conf to the screen
+wgm export office -o .\out       # write out\office.conf
+wgm export office -o office.conf # write to a specific file
+```
+
+> ⚠ Exported files contain your private key — handle them with care.
+
+---
+
+### `wgm autostart <tunnel>`
+
+Register a tunnel to start automatically at system boot. WGM creates a Windows scheduled task that brings the tunnel up as `SYSTEM` at startup (non-interactively). Requires administrator privileges.
+
+```
+wgm autostart office            # enable autostart at boot
+wgm autostart office --disable  # remove autostart
+```
+
+---
+
+### Hook scripts
+
+Like `wg-quick`, each tunnel can run commands at four points in its lifecycle. WGM executes them itself (WireGuard for Windows doesn't run hooks natively), so they work on Windows out of the box. Add a `hooks:` block to any tunnel:
+
+```yaml
+tunnels:
+  office:
+    interface:
+      private_key: "..."
+      addresses: ["10.10.0.2/24"]
+    hooks:
+      pre_up:    "echo bringing office up"
+      post_up:   "route add 10.20.0.0 mask 255.255.0.0 10.10.0.1"
+      pre_down:  "echo bringing office down"
+      post_down: "route delete 10.20.0.0"
+    peers:
+      - public_key: "..."
+        endpoint: "vpn.example.com:51820"
+        allowed_ips: ["0.0.0.0/0"]
+```
+
+- Each hook may be a single command string or a list of commands.
+- Commands run through the shell; the `WGM_TUNNEL` environment variable is set to the tunnel name.
+- Hooks are best-effort — a failing hook is reported as a warning but never aborts the tunnel operation.
+- You can also edit hooks interactively via `wgm config edit` → *A tunnel* → *Hook scripts*.
 
 ---
 

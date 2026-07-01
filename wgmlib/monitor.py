@@ -5,6 +5,7 @@ tunnel, htop-style: real-time transfer rates, handshake freshness and totals.
 from __future__ import annotations
 
 import time
+from collections import deque
 from datetime import datetime
 
 import typer
@@ -18,6 +19,100 @@ from rich import box
 from wgmlib.format import format_bytes, format_rate, format_handshake_age, handshake_health
 
 _HEALTH_STYLE = {"healthy": "green", "stale": "yellow", "dead": "red"}
+
+# Vertical block ramp (eighths), from empty to full — used to build the
+# btop-style area graph one row at a time.
+_BLOCKS = " ▁▂▃▄▅▆▇█"
+# How many samples of rate history to keep for the graphs.
+_HISTORY = 240
+# Height of each throughput graph, in text rows.
+_GRAPH_HEIGHT = 8
+
+# Vertical color gradients (bottom → top), btop-style. Low throughput is a cool
+# calm hue, ramping to a hot/bright hue at the peak.
+_RX_GRADIENT = [(0x0d, 0x5c, 0x33), (0x22, 0xc5, 0x5e), (0xd9, 0xf9, 0x5b)]
+_TX_GRADIENT = [(0x2a, 0x3d, 0x8f), (0x63, 0x7c, 0xff), (0xe0, 0x7c, 0xff)]
+
+
+def _lerp_gradient(stops: list[tuple[int, int, int]], t: float) -> str:
+    """Interpolate a multi-stop RGB gradient at position *t* in [0, 1] → '#rrggbb'."""
+    if t <= 0:
+        r, g, b = stops[0]
+        return f"#{r:02x}{g:02x}{b:02x}"
+    if t >= 1:
+        r, g, b = stops[-1]
+        return f"#{r:02x}{g:02x}{b:02x}"
+    span = len(stops) - 1
+    pos = t * span
+    i = int(pos)
+    frac = pos - i
+    r1, g1, b1 = stops[i]
+    r2, g2, b2 = stops[i + 1]
+    r = round(r1 + (r2 - r1) * frac)
+    g = round(g1 + (g2 - g1) * frac)
+    b = round(b1 + (b2 - b1) * frac)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _area_graph(values, width: int, height: int, peak: float,
+                gradient: list[tuple[int, int, int]]) -> list[Text]:
+    """Render *values* as a tall, gradient-filled area graph.
+
+    Returns *height* Text rows (top-to-bottom). Each row is a single gradient
+    color (cool at the base, hot at the crest) so tall columns fade upward,
+    mimicking btop's usage meters.
+    """
+    if width <= 0 or height <= 0:
+        return [Text("") for _ in range(max(0, height))]
+
+    recent = list(values)[-width:]
+    if len(recent) < width:
+        recent = [0.0] * (width - len(recent)) + recent
+    scale = peak if peak > 0 else 1.0
+
+    rows: list[Text] = []
+    for r in range(height - 1, -1, -1):  # top row first
+        color = _lerp_gradient(gradient, r / (height - 1) if height > 1 else 1.0)
+        chars: list[str] = []
+        for v in recent:
+            frac = min(1.0, max(0.0, v / scale))
+            total_eighths = frac * height * 8.0
+            cell = total_eighths - r * 8.0
+            cell = 0 if cell <= 0 else (8 if cell >= 8 else int(round(cell)))
+            chars.append(_BLOCKS[cell])
+        rows.append(Text("".join(chars), style=color))
+    return rows
+
+
+def _graph_block(label: str, hist, width: int, height: int,
+                 gradient: list[tuple[int, int, int]], accent: str) -> Group:
+    """One labelled throughput graph (header line + area graph)."""
+    peak = max(hist) if hist else 0.0
+    now = hist[-1] if hist else 0.0
+
+    header = Table.grid(expand=True)
+    header.add_column(justify="left")
+    header.add_column(justify="right")
+    header.add_row(
+        f"[bold {accent}]{label}[/bold {accent}]  [{accent}]{format_rate(now)}[/{accent}]",
+        f"[dim]peak[/dim] [{accent}]{format_rate(peak)}[/{accent}]",
+    )
+
+    graph_rows = _area_graph(hist, width, height, peak, gradient)
+    return Group(header, *graph_rows)
+
+
+def _graph_panel(rx_hist, tx_hist, width: int) -> Panel:
+    """Build a panel with two tall gradient area graphs (download / upload)."""
+    graph_w = max(10, width - 4)
+
+    body = Group(
+        _graph_block("↓ RX", rx_hist, graph_w, _GRAPH_HEIGHT, _RX_GRADIENT, "green"),
+        "",
+        _graph_block("↑ TX", tx_hist, graph_w, _GRAPH_HEIGHT, _TX_GRADIENT, "magenta"),
+    )
+    return Panel(body, title="[bold]Throughput[/bold]", border_style="cyan",
+                 box=box.ROUNDED, padding=(1, 1))
 
 
 def run(interval: float = 1.0) -> None:
@@ -34,13 +129,15 @@ def run(interval: float = 1.0) -> None:
 
     interval = max(0.5, float(interval))
     prev: dict[tuple[str, str], tuple[int, int, float]] = {}
+    rx_hist: deque = deque(maxlen=_HISTORY)
+    tx_hist: deque = deque(maxlen=_HISTORY)
 
     try:
         with Live(console=console, screen=True, refresh_per_second=8, transient=True) as live:
             while True:
                 dump = wgm.wg_dump()
                 now = time.time()
-                renderable, prev = _build(wgm, dump, prev, now)
+                renderable, prev = _build(wgm, dump, prev, now, rx_hist, tx_hist)
                 live.update(renderable)
                 time.sleep(interval)
     except KeyboardInterrupt:
@@ -48,7 +145,7 @@ def run(interval: float = 1.0) -> None:
     console.print("[dim]Monitor stopped.[/dim]")
 
 
-def _build(wgm, dump: dict, prev: dict, now: float):
+def _build(wgm, dump: dict, prev: dict, now: float, rx_hist: deque, tx_hist: deque):
     configured = wgm.reload_config().get("tunnels", {})
     peer_names = _peer_name_maps(configured)
 
@@ -131,11 +228,18 @@ def _build(wgm, dump: dict, prev: dict, now: float):
         f"[dim]({format_bytes(total_tx)})[/dim]"
     )
 
+    # Record aggregate rates for the throughput graphs.
+    rx_hist.append(total_rx_rate)
+    tx_hist.append(total_tx_rate)
+    graph_width = wgm.console.size.width - 8
+
     footer = Align.center("[dim]Press [bold]Ctrl+C[/bold] to quit[/dim]")
 
     body = Group(
         header,
         Align.center(summary),
+        "",
+        _graph_panel(rx_hist, tx_hist, graph_width),
         "",
         table,
     )

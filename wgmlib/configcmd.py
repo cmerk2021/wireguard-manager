@@ -52,6 +52,38 @@ def _prompt_list(console, validation, label, kind, default=None):
             console.print("[warning]⚠[/warning] Enter at least one value.")
 
 
+def _subnet_list_names(wgm) -> set[str]:
+    """Names of every defined subnet_list, from the merged (included) config."""
+    resources = wgm.WGM_CONFIG.get("wgm", {}).get("resources", {}) or {}
+    subnets = resources.get("subnet_lists", {}) or {}
+    return set(subnets.keys())
+
+
+def _prompt_allowed_ips(console, wgm, validation, label, default=None):
+    """Prompt for allowed IPs, accepting either a valid CIDR or an @subnet_list
+    reference that resolves to CIDRs. Mirrors what `wgm up` will accept."""
+    known = _subnet_list_names(wgm)
+    while True:
+        raw = Prompt.ask(f"{label} [dim](CIDRs or @subnet_list, comma-separated)[/dim]", default=default)
+        items = [x.strip() for x in (raw or "").split(",") if x.strip()]
+        if not items:
+            console.print("[warning]⚠[/warning] Enter at least one value.")
+            continue
+        bad: list[str] = []
+        for x in items:
+            if x.startswith("@"):
+                if x[1:] not in known:
+                    bad.append(f"{x} (unknown subnet list)")
+            elif not validation.is_cidr(x):
+                bad.append(f"{x} (not a valid CIDR)")
+        if not bad:
+            return items
+        for b in bad:
+            console.print(f"[error]✗[/error] Invalid entry: {b}")
+        if known:
+            console.print(f"[dim]Known subnet lists: {', '.join('@' + n for n in sorted(known))}[/dim]")
+
+
 # --------------------------------------------------------------------------- #
 # validate
 # --------------------------------------------------------------------------- #
@@ -282,6 +314,49 @@ def _edit_endpoint(wgm, validation, console, raw):
     console.print(f"[success]✓[/success] Updated endpoint [bold]{name}[/bold].")
 
 
+def _edit_hooks(wgm, console, raw, tunnel, tname):
+    """Edit wg-quick-style hook scripts (pre/post up/down) for a tunnel."""
+    phases = [
+        ("pre_up", "Pre-up  (before the tunnel comes up)"),
+        ("post_up", "Post-up (after the tunnel is up)"),
+        ("pre_down", "Pre-down  (before the tunnel goes down)"),
+        ("post_down", "Post-down (after the tunnel is down)"),
+    ]
+    hooks = tunnel.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+
+    def _fmt(v):
+        if not v:
+            return "(none)"
+        if isinstance(v, list):
+            return "; ".join(str(x) for x in v)
+        return str(v)
+
+    labels = [f"{desc}  →  {_fmt(hooks.get(key))}" for key, desc in phases]
+    chosen = _pick(console, "Which hook?", labels)
+    if chosen is None:
+        return
+    phase = phases[labels.index(chosen)][0]
+
+    console.print(f"[dim]Current: {_fmt(hooks.get(phase))}[/dim]")
+    console.print("[dim]Enter a shell command, or leave blank to clear this hook.[/dim]")
+    cmd = Prompt.ask("Command", default="").strip()
+
+    if cmd:
+        hooks[phase] = cmd
+    else:
+        hooks.pop(phase, None)
+
+    if hooks:
+        tunnel["hooks"] = hooks
+    else:
+        tunnel.pop("hooks", None)
+
+    wgm.save_raw_config(raw)
+    console.print(f"[success]✓[/success] Updated hooks for tunnel [bold]{tname}[/bold].")
+
+
 def _edit_tunnel(wgm, validation, console, raw):
     tunnels = raw.setdefault("tunnels", {})
     names = list(tunnels.keys())
@@ -305,6 +380,7 @@ def _edit_tunnel(wgm, validation, console, raw):
         "Allowed IPs (routes)",
         "Persistent keepalive",
         "Health-check IP",
+        "Hook scripts",
     ])
     if field is None:
         return
@@ -329,6 +405,9 @@ def _edit_tunnel(wgm, validation, console, raw):
                                         default=", ".join(str(d) for d in interface.get("dns", [])) or "1.1.1.1")
     elif field == "MTU":
         interface["mtu"] = IntPrompt.ask("MTU", default=interface.get("mtu", 1420))
+    elif field == "Hook scripts":
+        _edit_hooks(wgm, console, raw, tunnel, tname)
+        return
     elif peer is None:
         console.print("[error]✗[/error] This tunnel has no peer to edit.")
         return
@@ -347,7 +426,7 @@ def _edit_tunnel(wgm, validation, console, raw):
             console.print("[error]✗[/error] Expected host:port.")
         peer["endpoint"] = val
     elif field == "Allowed IPs (routes)":
-        peer["allowed_ips"] = _prompt_list(console, validation, "Allowed IPs", "cidr",
+        peer["allowed_ips"] = _prompt_allowed_ips(console, wgm, validation, "Allowed IPs",
                                            default=", ".join(str(a) for a in peer.get("allowed_ips", [])) or "0.0.0.0/0")
     elif field == "Persistent keepalive":
         peer["persistent_keepalive"] = IntPrompt.ask("Keepalive seconds", default=peer.get("persistent_keepalive", 25))

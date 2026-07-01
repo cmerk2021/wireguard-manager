@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import copy
 import ctypes
+import ipaddress
 import re
 import subprocess
 import sys
@@ -196,6 +197,86 @@ def require_admin():
         console.print("[bold red]Error:[/bold red] This command requires administrator privileges.")
         console.print("[dim]Please run wgm from an elevated terminal (Run as Administrator).[/dim]")
         raise typer.Exit(1)
+
+
+# Map raw WireGuard / Windows service error text to friendly, actionable messages.
+# Keys are matched case-insensitively as substrings of the raw stderr output.
+_WG_ERROR_MAP: list[tuple[str, str]] = [
+    ("does not exist as an installed service",
+     "The tunnel does not exist or is not currently up."),
+    ("already installed and running",
+     "The tunnel is already up."),
+    ("already exists",
+     "The tunnel is already up."),
+    ("access is denied",
+     "Access denied — run wgm from an elevated (administrator) terminal."),
+    ("the service cannot be started",
+     "The tunnel service could not start. Check the config with 'wgm doctor'."),
+    ("the service has not been started",
+     "The tunnel is not currently up."),
+    ("marked for deletion",
+     "The tunnel is still shutting down. Wait a moment and try again."),
+    ("unable to create configuration",
+     "The tunnel configuration is invalid. Run 'wgm config validate' to check it."),
+    ("interface name is invalid",
+     "The tunnel name is invalid for WireGuard."),
+]
+
+
+def friendly_wg_error(raw: str) -> str:
+    """Translate raw WireGuard/service stderr into a clear, human-readable message.
+
+    Falls back to the trimmed raw text (with a leading 'Error:' prefix removed)
+    when no known pattern matches.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return "The operation failed for an unknown reason."
+    low = text.lower()
+    for needle, friendly in _WG_ERROR_MAP:
+        if needle in low:
+            return friendly
+    # Strip a redundant leading "Error:" the WireGuard CLI often emits.
+    cleaned = re.sub(r"^error:\s*", "", text, flags=re.IGNORECASE).strip()
+    return cleaned or "The operation failed for an unknown reason."
+
+
+def tunnel_service_name(tunnel: str) -> str:
+    """Return the Windows service name WireGuard uses for *tunnel*."""
+    return f"WireGuardTunnel${tunnel}"
+
+
+def tunnel_service_exists(tunnel: str) -> bool:
+    """Return True if the WireGuard tunnel service is currently installed.
+
+    Uses `sc.exe query`; return code 1060 means the service does not exist.
+    """
+    try:
+        result = subprocess.run(
+            ["sc.exe", "query", tunnel_service_name(tunnel)],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        # If we cannot query, fall back to the interfaces list.
+        return tunnel in get_active_tunnel_names()
+    return result.returncode == 0
+
+
+def wait_for_service_removed(tunnel: str, timeout: float = 15.0, poll: float = 0.4) -> bool:
+    """Block until the tunnel service is fully removed by Windows.
+
+    `wireguard.exe /uninstalltunnelservice` returns immediately but the Service
+    Control Manager tears the service down asynchronously (it may sit in a
+    "marked for deletion" state). Reinstalling before that completes fails with
+    "Tunnel already installed and running". Returns True once gone, False on
+    timeout.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not tunnel_service_exists(tunnel):
+            return True
+        time.sleep(poll)
+    return not tunnel_service_exists(tunnel)
 
 
 def get_active_tunnel_names() -> set[str]:
@@ -624,10 +705,140 @@ def _print_ping_results(results: list[tuple[str, str, bool]]):
 
 # ---------- shared up/down logic (no elevation check — callers handle that) ----------
 
-def _do_up(tunnel: str):
+def _tunnel_allowed_networks(tunnel: str) -> list:
+    """Return the resolved AllowedIPs of *tunnel* as ip_network objects."""
+    cfg = resolve_tunnel_config(tunnel)
+    nets: list = []
+    if not cfg:
+        return nets
+    for peer in cfg.get("peers", []):
+        for ip in peer.get("allowed_ips", []) or []:
+            try:
+                nets.append(ipaddress.ip_network(str(ip), strict=False))
+            except ValueError:
+                continue
+    return nets
+
+
+def _active_allowed_networks(exclude: str) -> dict:
+    """Map active-tunnel-name -> list of ip_network objects from live `wg` state.
+
+    Only currently-up tunnels are considered; *exclude* is skipped.
+    """
+    out: dict = {}
+    for iface, data in wg_dump().items():
+        if iface == exclude:
+            continue
+        nets: list = []
+        for peer in data.get("peers", []):
+            for ip in peer.get("allowed_ips", []) or []:
+                try:
+                    nets.append(ipaddress.ip_network(str(ip), strict=False))
+                except ValueError:
+                    continue
+        if nets:
+            out[iface] = nets
+    return out
+
+
+def _check_subnet_overlap(tunnel: str) -> None:
+    """Warn if *tunnel*'s routes overlap those of any currently-up tunnel.
+
+    Down tunnels are ignored — only active tunnels can actually conflict for
+    routing. This is advisory only and never blocks the operation.
+    """
+    incoming = _tunnel_allowed_networks(tunnel)
+    if not incoming:
+        return
+    active = _active_allowed_networks(exclude=tunnel)
+    if not active:
+        return
+
+    conflicts: list[tuple[str, str, str]] = []  # (other_tunnel, incoming_net, other_net)
+    for other, other_nets in active.items():
+        for a in incoming:
+            for b in other_nets:
+                if a.version != b.version:
+                    continue
+                if a.overlaps(b):
+                    conflicts.append((other, str(a), str(b)))
+
+    if not conflicts:
+        return
+
+    console.print(
+        f"[warning]⚠  Routing overlap detected[/warning] — bringing up "
+        f"[bold]{tunnel}[/bold] may hijack traffic already routed by another tunnel:"
+    )
+    table = Table(box=box.SIMPLE_HEAD, header_style="bold", padding=(0, 1), show_edge=False)
+    table.add_column("This tunnel")
+    table.add_column("Overlaps")
+    table.add_column("Active tunnel")
+    for other, a, b in conflicts:
+        table.add_row(a, "↔", f"{b}  [dim]({other})[/dim]")
+    console.print(table)
+    console.print(
+        "[dim]Both tunnels claim overlapping subnets; the one brought up last wins "
+        "for those routes.[/dim]"
+    )
+
+
+def _run_hooks(tunnel: str, phase: str) -> None:
+    """Run any configured hook scripts for *tunnel* at the given *phase*.
+
+    Phases: 'pre_up', 'post_up', 'pre_down', 'post_down' (wg-quick style).
+    A hook value may be a single command string or a list of commands; each is
+    executed through the shell. A non-zero exit is reported but never aborts the
+    tunnel operation (matching wg-quick's best-effort PostUp/PostDown behavior).
+    """
+    raw_cfg = WGM_CONFIG.get("tunnels", {}).get(tunnel, {})
+    hooks = raw_cfg.get("hooks") or {}
+    if not isinstance(hooks, dict):
+        return
+    commands = hooks.get(phase)
+    if not commands:
+        return
+    if isinstance(commands, str):
+        commands = [commands]
+
+    label = phase.replace("_", "-")
+    for cmd in commands:
+        cmd = str(cmd)
+        if not cmd.strip():
+            continue
+        console.print(f"[dim]▸ {label}: {cmd}[/dim]")
+        try:
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True,
+                env={**os.environ, "WGM_TUNNEL": tunnel},
+            )
+        except Exception as exc:
+            console.print(f"[yellow]⚠[/yellow]  {label} hook failed to run: {exc}")
+            continue
+        if result.stdout.strip():
+            console.print(f"[dim]{result.stdout.strip()}[/dim]")
+        if result.returncode != 0:
+            err = result.stderr.strip() or f"exited with code {result.returncode}"
+            console.print(f"[yellow]⚠[/yellow]  {label} hook: {err}")
+
+
+def _do_up(tunnel: str, no_prompt: bool = False):
     # Resolve the handshake timeout from config, default 30s
     settings = WGM_CONFIG.get("wgm", {}).get("settings", {})
     handshake_timeout: int = int(settings.get("handshake_timeout", 30))
+
+    # Advisory: warn about routing overlaps with already-active tunnels.
+    _check_subnet_overlap(tunnel)
+
+    # A leftover service from a previous session (or an in-progress teardown)
+    # would make /installtunnelservice fail with "already installed and running".
+    if tunnel_service_exists(tunnel):
+        console.print(
+            f"[dim]A service for [bold]{tunnel}[/bold] is still present — waiting for it to clear…[/dim]"
+        )
+        wait_for_service_removed(tunnel)
+
+    _run_hooks(tunnel, "pre_up")
 
     with console.status(f"Generating config for [bold]{tunnel}[/bold]..."):
         ok = generate_config(tunnel)
@@ -644,8 +855,7 @@ def _do_up(tunnel: str):
 
     if result.returncode != 0:
         console.print(f"[bold red]✗ Failed to bring up '[bold]{tunnel}[/bold]'[/bold red]")
-        if result.stderr.strip():
-            console.print(f"[dim]{result.stderr.strip()}[/dim]")
+        console.print(f"[error]{friendly_wg_error(result.stderr)}[/error]")
         raise typer.Exit(1)
 
     console.print(f"[green]✓[/green] Tunnel service installed")
@@ -669,16 +879,19 @@ def _do_up(tunnel: str):
                     )
             else:
                 console.print("[green]✓[/green] All health checks passed")
+        _run_hooks(tunnel, "post_up")
     else:
         # No handshake within timeout
         _print_handshake_tips(tunnel)
 
-        keep = _prompt_keep_or_down(tunnel)
+        # Non-interactive callers (e.g. boot autostart) keep the tunnel up.
+        keep = True if no_prompt else _prompt_keep_or_down(tunnel)
         if keep:
             console.print(
                 f"\n[yellow]⚠[/yellow]  Tunnel [bold]{tunnel}[/bold] is [bold yellow]up (no handshake)[/bold yellow] — "
                 "use [bold]wgm status {tunnel}[/bold] to monitor.".format(tunnel=tunnel)
             )
+            _run_hooks(tunnel, "post_up")
         else:
             console.print()
             _do_down(tunnel)
@@ -687,6 +900,8 @@ def _do_up(tunnel: str):
 def _do_down(tunnel: str):
     config_file = TUNNELS_LOCATION / f"{tunnel}.conf"
 
+    _run_hooks(tunnel, "pre_down")
+
     with console.status(f"Removing tunnel service [bold]{tunnel}[/bold]..."):
         result = subprocess.run(
             [get_wg_dir() / "wireguard.exe", "/uninstalltunnelservice", tunnel],
@@ -694,6 +909,10 @@ def _do_down(tunnel: str):
         )
 
     if result.returncode == 0:
+        # SCM removes the service asynchronously — wait so a following `up`
+        # (e.g. from `wgm restart`) doesn't collide with the old service.
+        with console.status(f"Waiting for [bold]{tunnel}[/bold] to shut down..."):
+            wait_for_service_removed(tunnel)
         console.print(f"[green]✓[/green] Tunnel [bold]{tunnel}[/bold] is [bold red]down[/bold red]")
         # Only clean up the .conf after a successful uninstall
         if config_file.exists():
@@ -702,10 +921,10 @@ def _do_down(tunnel: str):
                 console.print("[dim]Config file cleaned up[/dim]")
             except Exception as e:
                 console.print(f"[yellow]Warning:[/yellow] Could not remove config file: {e}")
+        _run_hooks(tunnel, "post_down")
     else:
         console.print(f"[bold red]✗ Failed to bring down '[bold]{tunnel}[/bold]'[/bold red]")
-        if result.stderr.strip():
-            console.print(f"[dim]{result.stderr.strip()}[/dim]")
+        console.print(f"[error]{friendly_wg_error(result.stderr)}[/error]")
         raise typer.Exit(1)
 
 
@@ -757,11 +976,17 @@ def list_tunnels():
 
 
 @app.command()
-def up(tunnel: str):
+def up(
+    tunnel: str,
+    boot: bool = typer.Option(
+        False, "--boot", hidden=True,
+        help="Non-interactive mode used by autostart at boot.",
+    ),
+):
     """Bring up a WireGuard tunnel."""
     require_admin()
     ensure_deps()
-    _do_up(tunnel)
+    _do_up(tunnel, no_prompt=boot)
 
 
 @app.command()
@@ -777,7 +1002,17 @@ def restart(tunnel: str):
     """Bring a tunnel down then immediately back up (re-reads config)."""
     require_admin()
     ensure_deps()
-    _do_down(tunnel)
+
+    # Only tear down if the tunnel is actually up; otherwise a missing-service
+    # error would abort before we ever bring it up.
+    if tunnel_service_exists(tunnel):
+        _do_down(tunnel)
+    else:
+        console.print(f"[dim]{tunnel} is not currently up — skipping the down step.[/dim]")
+
+    # Ensure the service is fully gone before reinstalling (fixes the race where
+    # a stale service made 'up' fail with "already installed and running").
+    wait_for_service_removed(tunnel)
     _do_up(tunnel)
 
 
@@ -909,6 +1144,36 @@ def stat(
     """Alias for 'wgm monitor'."""
     from wgmlib import monitor as _monitor
     _monitor.run(interval)
+
+
+@app.command("import")
+def import_config(
+    source: str = typer.Argument(..., help="Path to a WireGuard .conf file to import."),
+    name: str = typer.Option(None, "--name", "-n", help="Name for the imported tunnel (defaults to the file name)."),
+):
+    """Import a standard WireGuard .conf file as a WGM tunnel."""
+    from wgmlib import portability
+    portability.run_import(source, name)
+
+
+@app.command()
+def export(
+    tunnel: str = typer.Argument(..., help="Tunnel to export."),
+    output: str = typer.Option(None, "--output", "-o", help="Write to this file/folder instead of the screen."),
+):
+    """Export a tunnel to a standard WireGuard .conf file (for other clients)."""
+    from wgmlib import portability
+    portability.run_export(tunnel, output)
+
+
+@app.command()
+def autostart(
+    tunnel: str = typer.Argument(..., help="Tunnel to start automatically at boot."),
+    disable: bool = typer.Option(False, "--disable", "-d", help="Disable autostart for this tunnel."),
+):
+    """Start a tunnel automatically on system boot (Windows scheduled task)."""
+    from wgmlib import autostart as _autostart
+    _autostart.run(tunnel, disable)
 
 
 # Register `wgm config` sub-commands (add / edit / remove / validate / path).

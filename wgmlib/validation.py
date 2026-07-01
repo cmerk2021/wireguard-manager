@@ -226,6 +226,27 @@ def _validate_tunnel(name, t, subnet_lists, dns_profiles, endpoints, err, warn):
     if "mtu" in iface and not is_positive_int(iface["mtu"]):
         err(f"{base}.interface.mtu", f"Must be an integer, got {iface['mtu']!r}.")
 
+    # hooks (wg-quick-style pre/post up/down scripts)
+    hooks = t.get("hooks")
+    if hooks is not None:
+        if not isinstance(hooks, dict):
+            err(f"{base}.hooks", "Must be a mapping of hook phase -> command(s).")
+        else:
+            valid_phases = {"pre_up", "post_up", "pre_down", "post_down"}
+            for phase, cmds in hooks.items():
+                if phase not in valid_phases:
+                    warn(f"{base}.hooks.{phase}",
+                         f"Unknown hook phase (expected one of {', '.join(sorted(valid_phases))}).")
+                if isinstance(cmds, str):
+                    if not cmds.strip():
+                        err(f"{base}.hooks.{phase}", "Hook command is empty.")
+                elif isinstance(cmds, list):
+                    for c in cmds:
+                        if not isinstance(c, str) or not c.strip():
+                            err(f"{base}.hooks.{phase}", "Each hook command must be a non-empty string.")
+                else:
+                    err(f"{base}.hooks.{phase}", "Hook must be a command string or list of strings.")
+
     # peers
     peers = t.get("peers")
     if not peers:
