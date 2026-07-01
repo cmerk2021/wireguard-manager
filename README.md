@@ -211,7 +211,7 @@ Rules:
 
 ## Commands
 
-> **New here?** Just run `wgm wizard` \u2014 it creates a working tunnel for you. Everything below is available once you want finer control.
+> **New here?** Just run `wgm wizard` — it creates a working tunnel for you. Everything below is available once you want finer control.
 
 ### `wgm wizard`
 
@@ -219,12 +219,66 @@ Interactively create a fully functional tunnel without ever touching YAML. The w
 
 Two modes:
 
-- **basic** \u2014 just the essentials: name, keys, address, server, and what traffic to route.
-- **expert** \u2014 everything in basic, plus MTU, persistent keepalive, pre-shared key, and a health-check IP.
+- **basic** — just the essentials: name, keys, address, server, and what traffic to route.
+- **expert** — everything in basic, plus MTU, persistent keepalive, pre-shared key, and a health-check IP.
 
 Start it with either:
 
-```\nwgm wizard          # asks you to choose basic or expert\nwgm wizard --expert # jump straight into expert mode\n```\n\nHighlights of the flow:\n\n- **Keys** \u2014 \u201cDo you have your own keypair, or should WGM generate one?\u201d If generated, WGM shows the **public key** to hand to your server admin and stores the private key for you.\n- **Traffic presets** \u2014 choose what goes through the VPN:\n  - **All traffic (full tunnel)** \u2014 `0.0.0.0/0, ::/0`\n  - **All private networks** \u2014 `10/8, 172.16/12, 192.168/16`\n  - **Custom subnets** \u2014 enter your own CIDRs\n- **DNS presets** \u2014 Cloudflare, Google, Quad9, or custom.\n- Every value is validated as you type, so you can't save a broken tunnel.\n- A review panel summarizes everything before saving, and WGM offers to bring the tunnel up immediately.\n\nOn first run the wizard also asks where WireGuard is installed (auto-detecting `C:\\Program Files\\WireGuard`) and remembers it.\n\n---\n\n### `wgm config`\n\nManage everything in your config without editing YAML.\n\n| Command | What it does |\n|---|---|\n| `wgm config add` | Add a subnet list, DNS profile, endpoint, or setting |\n| `wgm config edit` | Edit settings, a resource, or any of a tunnel's fields (including keys, address, routes, endpoint, keepalive, MTU, health check) |\n| `wgm config remove` | Remove a tunnel or resource |\n| `wgm config validate` | Type-check the whole config (see below) |\n| `wgm config path` | Show where the config and data files live |\n\nAll of these are menu-driven \u2014 pick an option by number and answer the prompts. Your existing formatting and comments in `wgm.yaml` are preserved on save.\n\n---\n\n### `wgm config validate`\n\nValidate the structure and value types of your config. WGM checks that every field is the right type \u2014 integers where integers belong, valid IP addresses, CIDRs, ports, `host:port` endpoints, and 44-character WireGuard keys \u2014 and that every `@reference` and `include:` path resolves.\n\n```\n$ wgm config validate\n     Location                          Problem\n \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n \u2717   tunnels.office.interface.private_key   Placeholder/empty private key \u2014 run 'wgm keygen'.\n \u26a0   tunnels.office.peers[0].endpoint       Undefined endpoint ref '@office_vpn'.\n\nSummary: 1 error(s), 1 warning(s).\n```\n\nExits with a non-zero status if any **errors** are found, so it's safe to use in scripts.\n\n---\n\n### `wgm list`", "oldString": "## Commands\n\n### `wgm list`"}]
+```
+wgm wizard          # asks you to choose basic or expert
+wgm wizard --expert # jump straight into expert mode
+```
+
+Highlights of the flow:
+
+- **Keys** — “Do you have your own keypair, or should WGM generate one?” If generated, WGM shows the **public key** to hand to your server admin and stores the private key for you.
+- **Traffic presets** — choose what goes through the VPN:
+  - **All traffic (full tunnel)** — `0.0.0.0/0, ::/0`
+  - **All private networks** — `10/8, 172.16/12, 192.168/16`
+  - **Custom subnets** — enter your own CIDRs
+- **DNS presets** — Cloudflare, Google, Quad9, or custom.
+- Every value is validated as you type, so you can't save a broken tunnel.
+- A review panel summarizes everything before saving, and WGM offers to bring the tunnel up immediately.
+
+On first run the wizard also asks where WireGuard is installed (auto-detecting `C:\Program Files\WireGuard`) and remembers it.
+
+---
+
+### `wgm config`
+
+Manage everything in your config without editing YAML.
+
+| Command | What it does |
+|---|---|
+| `wgm config add` | Add a subnet list, DNS profile, endpoint, or setting |
+| `wgm config edit` | Edit settings, a resource, or any of a tunnel's fields (including keys, address, routes, endpoint, keepalive, MTU, health check) |
+| `wgm config remove` | Remove a tunnel or resource |
+| `wgm config validate` | Type-check the whole config (see below) |
+| `wgm config path` | Show where the config and data files live |
+
+All of these are menu-driven — pick an option by number and answer the prompts. Your existing formatting and comments in `wgm.yaml` are preserved on save.
+
+---
+
+### `wgm config validate`
+
+Validate the structure and value types of your config. WGM checks that every field is the right type — integers where integers belong, valid IP addresses, CIDRs, ports, `host:port` endpoints, and 44-character WireGuard keys — and that every `@reference` and `include:` path resolves.
+
+```
+$ wgm config validate
+     Location                          Problem
+ ───────────────────────────────────────────────────────────
+ ✗   tunnels.office.interface.private_key   Placeholder/empty private key — run 'wgm keygen'.
+ ⚠   tunnels.office.peers[0].endpoint       Undefined endpoint ref '@office_vpn'.
+
+Summary: 1 error(s), 1 warning(s).
+```
+
+Exits with a non-zero status if any **errors** are found, so it's safe to use in scripts.
+
+---
+
+### `wgm list`
 
 List all configured tunnels with their status, addresses, and peer count.
 
@@ -350,13 +404,57 @@ Omit the tunnel name to show all currently active tunnels.
 
 ### `wgm monitor` (alias `wgm stat`)
 
-A live, full-screen dashboard of every tunnel \u2014 htop-style. Shows each peer's endpoint, handshake freshness (green/yellow/red), cumulative transfer, and **real-time transfer rates** computed between refreshes, plus a running total across all tunnels. A **throughput panel** draws live sparkline graphs of the aggregate download (green) and upload (magenta) rates, with running peaks. Configured-but-down tunnels are listed too.
+A live, full-screen dashboard of every tunnel — htop-style. Shows each peer's endpoint, handshake freshness (green/yellow/red), cumulative transfer, and **real-time transfer rates** computed between refreshes, plus a running total across all tunnels. A **throughput panel** draws live sparkline graphs of the aggregate download (green) and upload (magenta) rates, with running peaks. Configured-but-down tunnels are listed too.
 
-```\nwgm monitor              # refresh every second\nwgm monitor --interval 2 # refresh every 2 seconds\n```\n\nPress **Ctrl+C** to quit. Requires administrator privileges (WireGuard only exposes live peer stats to elevated processes).\n\n---\n\n### `wgm doctor [tunnel]`\n\nRun a full diagnostic suite with troubleshooting steps for anything that fails.\n\n**General diagnostics** (no tunnel name):\n\n- Config file loads and parses\n- All `include:` files resolve\n- Config validation (errors/warnings)\n- WireGuard binaries are present\n- Administrator rights\n- Internet connectivity\n- DNS resolution\n- Which tunnels are currently active\n\n**Tunnel diagnostics** (`wgm doctor <tunnel>`) adds:\n\n- The tunnel exists and its fields are valid\n- The endpoint resolves \u2014 if it's a domain, WGM shows the resolved IP(s)\n- If the tunnel is up: per-peer handshake freshness and transfer, plus any configured `health_check_ip` pings\n\nEach failed or warned check is followed by concrete fix steps, and a summary panel tells you whether everything passed.\n\n```\n$ wgm doctor office\n\u256d\u2500 General \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e\n\u2502  \u2713  Config file loads       ...\\WGM\\wgm.yaml                    \u2502\n\u2502  \u2713  WireGuard binaries      C:\\Program Files\\WireGuard          \u2502\n\u2502  \u2713  Internet connectivity   reached 1.1.1.1                     \u2502\n\u2502  \u2713  DNS resolution          cloudflare.com \u2192 104.16.132.229      \u2502\n\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\n\u256d\u2500 Tunnel: office \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e\n\u2502  \u2713  Endpoint DNS (peer 1)   vpn.example.com \u2192 203.0.113.10        \u2502\n\u2502  \u2713  Handshake (abc123\u2026)     12s ago \u00b7 \u219314.3 MiB \u21912.1 MiB          \u2502\n\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\n```\n\n---\n\n### `wgm keygen`", "oldString": "Omit the tunnel name to show all currently active tunnels.
+```
+wgm monitor              # refresh every second
+wgm monitor --interval 2 # refresh every 2 seconds
+```
+
+Press **Ctrl+C** to quit. Requires administrator privileges (WireGuard only exposes live peer stats to elevated processes).
 
 ---
 
-### `wgm keygen`"}]
+### `wgm doctor [tunnel]`
+
+Run a full diagnostic suite with troubleshooting steps for anything that fails.
+
+**General diagnostics** (no tunnel name):
+
+- Config file loads and parses
+- All `include:` files resolve
+- Config validation (errors/warnings)
+- WireGuard binaries are present
+- Administrator rights
+- Internet connectivity
+- DNS resolution
+- Which tunnels are currently active
+
+**Tunnel diagnostics** (`wgm doctor <tunnel>`) adds:
+
+- The tunnel exists and its fields are valid
+- The endpoint resolves — if it's a domain, WGM shows the resolved IP(s)
+- If the tunnel is up: per-peer handshake freshness and transfer, plus any configured `health_check_ip` pings
+
+Each failed or warned check is followed by concrete fix steps, and a summary panel tells you whether everything passed.
+
+```
+$ wgm doctor office
+╭─ General ────────────────────────────────────────────╮
+│  ✓  Config file loads       ...\WGM\wgm.yaml                    │
+│  ✓  WireGuard binaries      C:\Program Files\WireGuard          │
+│  ✓  Internet connectivity   reached 1.1.1.1                     │
+│  ✓  DNS resolution          cloudflare.com → 104.16.132.229      │
+╰───────────────────────────────────────────────╯
+╭─ Tunnel: office ─────────────────────────────────────╮
+│  ✓  Endpoint DNS (peer 1)   vpn.example.com → 203.0.113.10        │
+│  ✓  Handshake (abc123…)     12s ago · ↓14.3 MiB ↑2.1 MiB          │
+╰────────────────────────────────────────────╯
+```
+
+---
+
+### `wgm keygen`
 
 Generate a new WireGuard private/public key pair. Paste the private key into your `wgm.yaml` and share the public key with your peer.
 
@@ -498,6 +596,9 @@ On load, WGM merges any `include:` files into a single view, then resolves `@res
 | `wgm config remove` | Remove a tunnel or resource |
 | `wgm config validate` | Type-check the config |
 | `wgm config path` | Show config/data file locations |
+| `wgm import <config.conf>` | Import a WireGuard `.conf` file |
+| `wgm export <tunnel>` | Export a tunnel to `.conf` |
+| `wgm autostart <tunnel> [--disable]` | Register/remove boot autostart (admin) |
 | `wgm version` | Show the WGM version |
 
 ---
